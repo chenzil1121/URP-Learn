@@ -1,0 +1,65 @@
+#pragma kernel CSBasic
+#pragma kernel CSDetail
+#include "CloudNoiseHelp.hlsl"
+static const int numThreads = 8;
+
+RWTexture3D<float> Result;
+
+#define kBasicFrequency 4.0
+#define kBasicNoiseMixFactor 0.5
+#define kDetailFrequency 8.0
+
+float remap(float x, float a, float b, float c, float d)
+{
+    return (((x - a) / (b - a)) * (d - c)) + c;
+}
+
+float basicNoiseComposite(float4 v)
+{
+    float wfbm = v.y * 0.625 + v.z * 0.25 + v.w * 0.125;
+
+    // cloud shape modeled after the GPU Pro 7 chapter
+    return remap(v.x, wfbm - 1.0, 1.0, 0.0, 1.0);
+}
+
+[numthreads(numThreads, numThreads, 1)] 
+void CSBasic (uint3 id : SV_DispatchThreadID)
+{
+    uint3 texSize;
+    Result.GetDimensions(texSize.x, texSize.y, texSize.z);
+
+    if (id.x >= texSize.x || id.y >= texSize.y || id.z >= texSize.z)
+        return;
+
+    const float3 uvw = (float3(id) +float3(0.5,0.5,0.5)) / float3(texSize);
+    float pfbm = lerp(1.0, perlinfbm(uvw, kBasicFrequency, 7), kBasicNoiseMixFactor);
+    pfbm = abs(pfbm * 2.0 - 1.0); // billowy perlin noise
+
+    float4 col = float4(0, 0, 0, 0);
+    col.g += worleyFbm(uvw, kBasicFrequency);
+    col.b += worleyFbm(uvw, kBasicFrequency * 2.0);
+    col.a += worleyFbm(uvw, kBasicFrequency * 4.0);
+
+    col.r += remap(pfbm, 0., 1., col.g, 1.0); // perlin-worley
+
+    Result[id] = basicNoiseComposite(col);
+}
+
+[numthreads(numThreads, numThreads, 1)]
+void CSDetail(uint3 id : SV_DispatchThreadID)
+{
+    uint3 texSize;
+    Result.GetDimensions(texSize.x, texSize.y, texSize.z);
+
+    if (id.x >= texSize.x || id.y >= texSize.y || id.z >= texSize.z)
+        return;
+
+    const float3 uvw = (float3(id) + float3(0.5,0.5,0.5)) / float3(texSize);
+
+    float detailNoise =
+        worleyFbm(uvw, kDetailFrequency * 1.0) * 0.625 +
+        worleyFbm(uvw, kDetailFrequency * 2.0) * 0.250 +
+        worleyFbm(uvw, kDetailFrequency * 4.0) * 0.125;
+
+    Result[id] = detailNoise;
+}

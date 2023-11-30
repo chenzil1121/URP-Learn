@@ -1,0 +1,194 @@
+#include "RayTracingHelp.hlsl"
+#include "DDGICommon.hlsl"
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
+
+//前三维是radiance，后一维是hit distance
+RWTexture2DArray<float4> _RayData;
+Texture2DArray<float4> _ProbeDistance;
+Texture2DArray<float4> _ProbeIrradiance;
+//Texture2D<float4> _AtmosphericScatteringLut;
+
+RaytracingAccelerationStructure  _RaytracingAccelerationStructure;
+
+SamplerState sampler_LinearClamp;
+
+int _ProbeCount[3];
+float _ProbeSpacing[3];
+float _Origin[3];
+int _ProbeNumRays;
+float4 _ProbeRayRotation;
+float _ProbeNormalBias;
+float _ProbeViewBias;
+float _ProbeMaxRayDistance;
+float _ProbeIrradianceEncodingGamma;
+int _ProbeNumDistanceInteriorTexels;
+int _ProbeNumIrradianceInteriorTexels;
+
+//目前先考虑主光源的直接光
+float4 _MainLightPosition;
+//考虑了Intensity
+float4 _MainLightColor;
+
+#pragma max_recursion_depth 1
+
+float2 ViewDirToUV(float3 v)
+{
+	//这里应该是因为asin和acos返回的值是-pi/2到pi/2，由于要归一化到0-1，后续的+0.5操作会影响sin变为cos，正好符合uv到view的映射
+	float2 uv = float2(atan2(v.z, v.x), asin(v.y));
+	uv /= float2(2.0 * PI, PI);
+	uv += float2(0.5, 0.5);
+
+	return uv;
+}
+
+float LightVisibility(RayPayload rayPayload, float3 lightVector, float tmax, float normalBias)
+{
+    RayDesc ray;
+    ray.Origin = rayPayload.worldPosition + (rayPayload.normal * normalBias);
+    ray.Direction = normalize(lightVector);
+    ray.TMin = 0.f;
+    ray.TMax = tmax;
+
+    // Trace a visibility ray
+    // Skip the CHS to avoid evaluating materials
+    RayPayload visPayload = (RayPayload)0;
+    TraceRay(
+        _RaytracingAccelerationStructure,
+        RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,
+        0xFF,
+        0,
+        1,
+        0,
+        ray,
+        visPayload);
+
+    return (visPayload.hitT < 0.f);
+}
+
+float3 DirectDiffuseLighting(RayPayload rayPayload, float normalBias)
+{
+    float3 brdf = (rayPayload.albedo / PI);
+
+    float visibility = LightVisibility(rayPayload, _MainLightPosition.xyz, 1e27f, normalBias);
+
+    // Early out, the light isn't visible from the surface
+    if (visibility <= 0.f) return float3(0.f, 0.f, 0.f);
+
+    float3 lightDirection = _MainLightPosition.xyz;
+    float  nol = max(dot(rayPayload.shadingNormal, lightDirection), 0.f);
+
+    return _MainLightColor.rgb * nol * visibility * brdf;
+}
+
+[shader("miss")]
+void ProbeMissShader(inout RayPayload rayPayload : SV_RayPayload)
+{
+	rayPayload.hitT = -1.0;
+}
+
+[shader("raygeneration")]
+void ProbeRayGenShader()
+{
+	// 当前Probe下的光线ID
+    int rayIndex = DispatchRaysIndex().x;
+    // 当前Plane内的Probe ID
+    int probePlaneIndex = DispatchRaysIndex().y;   
+    // Plane ID
+    int planeIndex = DispatchRaysIndex().z;
+
+    // Probe在三个轴上的数量
+    int3 probeCount = int3(_ProbeCount[0], _ProbeCount[1], _ProbeCount[2]);
+    // Probe在三个轴上的间距
+    float3 probeSpacing = float3(_ProbeSpacing[0], _ProbeSpacing[1], _ProbeSpacing[2]);
+    // Volume的中心
+    float3 origin = float3(_Origin[0], _Origin[1], _Origin[2]);
+
+    // 每个Plane下的Probe数量
+    int probesPerPlane = probeCount.x * probeCount.z;
+    // Probe的全局ID(在这个Volume内)
+    int probeIndex = (planeIndex * probesPerPlane) + probePlaneIndex;
+    // Grid空间下的坐标
+    float3 probeCoords = DDGIGetProbeCoords(probeIndex, probeCount);
+    // 世界空间下当前Probe的位置
+    float3 probeWorldPosition = DDGIGetProbeWorldPosition(probeCoords, probeCount, probeSpacing, origin);
+
+    // 随机光线方向
+    float3 probeRayDirection = DDGIGetProbeRayDirection(rayIndex, _ProbeNumRays, _ProbeRayRotation);
+
+    RayDesc rayDesc;
+    rayDesc.Origin = probeWorldPosition;
+    rayDesc.Direction = probeRayDirection;
+    rayDesc.TMin = 0.f;
+    rayDesc.TMax = _ProbeMaxRayDistance;
+
+    RayPayload rayPayload = (RayPayload)0;
+    TraceRay(
+        _RaytracingAccelerationStructure, 
+        RAY_FLAG_NONE, 
+        0xFF, 
+        0,
+        1,
+        0,
+        rayDesc,
+        rayPayload
+        );
+
+    // 输出的纹理坐标
+    uint3 outputCoords = DDGIGetRayDataTexelCoords(rayIndex, probeIndex, probeCount);
+
+    // 光线未打中任何物体
+    if(rayPayload.hitT < 0)
+    {
+        // radiance是天空盒的颜色，击中距离是一个较大值
+        float3 DirectLight = _MainLightColor.rgb;
+        //float3 skyLight = _AtmosphericScatteringLut.SampleLevel(sampler_LinearClamp, ViewDirToUV(probeRayDirection), 0).rgb;
+        _RayData[outputCoords]=float4(DirectLight, 1e27f);
+        return;
+    }
+
+    // 光线击中背面
+    if(rayPayload.hitKind == HIT_KIND_TRIANGLE_BACK_FACE)
+    {
+        _RayData[outputCoords]=float4(0, 0, 0, -rayPayload.hitT * 0.2f);
+        return;
+    }
+
+    // 光线正常击中物体
+    if(rayPayload.hitKind == HIT_KIND_TRIANGLE_FRONT_FACE)
+    {
+        float3 directColor = DirectDiffuseLighting(rayPayload, 0.008);
+
+        float3 surfaceBias = DDGIGetSurfaceBias(rayPayload.normal, rayDesc.Direction, _ProbeNormalBias, _ProbeViewBias);
+        float3 irradiance = 0.f;
+        // Compute volume blending weight
+        float volumeBlendWeight = DDGIGetVolumeBlendWeight(rayPayload.worldPosition, origin, probeCount, probeSpacing);
+
+        // Don't evaluate irradiance when the surface is outside the volume
+        if (volumeBlendWeight > 0)
+        {
+            // Get irradiance from the DDGIVolume
+            irradiance = DDGIGetVolumeIrradiance(
+                rayPayload.worldPosition,
+                surfaceBias,
+                rayPayload.normal,
+                origin,
+                probeCount,
+                probeSpacing,
+                _ProbeNumDistanceInteriorTexels,
+                _ProbeNumIrradianceInteriorTexels,
+                _ProbeIrradianceEncodingGamma,
+                _ProbeDistance,
+                _ProbeIrradiance,
+                sampler_LinearClamp
+                );
+
+            // Attenuate irradiance by the blend weight
+            irradiance *= volumeBlendWeight;
+        }
+
+        float3 radiance = directColor + (rayPayload.albedo / PI) * irradiance;
+
+        _RayData[outputCoords]=float4(radiance, rayPayload.hitT);
+        return;
+    }
+}
