@@ -48,9 +48,10 @@ feature
 reference  
 - https://github.com/NVIDIAGameWorks/RTXGI
 - https://github.com/MartinMisiak/URP-VR-Raytracing
+
 video in **Recordings/DDGI.mp4**
 
-Scene:链接：https://pan.baidu.com/s/1ZpRZ8DagZF_pxBAs0BClBw?pwd=12xm  
-提取码：12xm 
-Video:链接：链接：https://pan.baidu.com/s/1QehHjqn03VxowkQyVQHQYg?pwd=jn5w 
+Scene链接：https://pan.baidu.com/s/1ZpRZ8DagZF_pxBAs0BClBw?pwd=12xm  
+提取码：12xm  
+Video链接：https://pan.baidu.com/s/1QehHjqn03VxowkQyVQHQYg?pwd=jn5w  
 提取码：jn5w 
